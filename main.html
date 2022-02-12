@@ -1,0 +1,1826 @@
+<html>
+<head>
+<script src="setImmediate.min.js"></script>
+</head>
+<body>
+<canvas id="map" width="800" height="600"></canvas>
+<div id="stats"></div>
+<label>Grid size: <input type="range" id="size" min="0" max="9.2288" step="any" value="2.3219"></input></label>
+<div id="debug"></div>
+<script>
+var squareSize = 5;
+var gridWidth = 800 / squareSize;
+var gridHeight = 600 / squareSize;
+var canvas = document.getElementById("map");
+var ctx = canvas.getContext("2d");
+var bgLayer = document.createElement("canvas"); // TODO: consider OffscreenCanvas if available?
+var startPos = { x: 0, y: 0 };
+var endPos = { x: 0, y: 0 };
+var stats = document.getElementById("stats");
+var dbg = document.getElementById("debug");
+var heuristicTotalDist = 0;
+var reach = [];
+var reachDone = false;
+var jumpBound = Infinity;
+var edgeReaches = [];
+var reachWorklist = [];
+var landmarks = [];
+
+var mapConfig = {
+    diagMode: 0,
+    diagonalDistance: Math.SQRT2,
+    slantDistance: Math.sqrt(5)
+};
+
+var algorithmConfig = {
+    bidi: false,
+    potentialFunc: 0,
+    euclidean: false,
+    jumpPoint: 1,
+    dualJps: false,
+    prioritize: false,
+    reach: 0,
+    useLandmarks: false
+};
+
+var displayData = null;
+
+var density = 0.35;
+var walls = 0;
+var colors = false;
+
+// Helper functions
+function genArray(size, func) {
+    var ret = new Array(size);
+    for (var i = 0; i < size; i++) {
+        ret[i] = func(i);
+    }
+    return ret;
+}
+
+function genMap(func) {
+    return genArray(gridHeight, function(y) {
+        return genArray(gridWidth, function(x) {
+            return func(x, y);
+        });
+    });
+}
+
+function iterGrid(func) {
+    for (var y = 0; y < gridHeight; y++) {
+        for (var x = 0; x < gridWidth; x++) {
+            func(x, y);
+        }
+    }
+}
+
+function iterMap(func) {
+    for (var y = 0; y < gridHeight; y++) {
+        for (var x = 0; x < gridWidth; x++) {
+            if (!map[y][x]) {
+                func(x, y);
+            }
+        }
+    }
+}
+
+// Heap Implementation
+
+function insertHeap(heap, value) {
+    var index = heap.length;
+    var parent = Math.floor((index - 1) / 2);
+    heap.push(value);
+    // sift up
+    while (index !== 0 && heap[parent].priority > heap[index].priority) {
+        var temp = heap[index];
+        heap[index] = heap[parent];
+        heap[parent] = temp;
+
+        index = parent;
+        parent = Math.floor((index - 1) / 2);
+    }
+}
+
+function deleteMin(heap) {
+    var ret = heap[0];
+    var last = heap.pop();
+    if (heap.length !== 0) {
+        heap[0] = last;
+        // sift down
+        var index = 0;
+        while ((index * 2 + 1 < heap.length && heap[index].priority > heap[index * 2 + 1].priority) || (index * 2 + 2 < heap.length && heap[index].priority > heap[index * 2 + 2].priority)) {
+            var nextIndex;
+            if (index * 2 + 2 >= heap.length || heap[index * 2 + 1].priority < heap[index * 2 + 2].priority) {
+                nextIndex = index * 2 + 1;
+            } else {
+                nextIndex = index * 2 + 2;
+            }
+            var temp = heap[index];
+            heap[index] = heap[nextIndex];
+            heap[nextIndex] = temp;
+            index = nextIndex;
+        }
+    }
+    return ret;
+}
+
+// Pathfinding
+
+function heuristic(source, dest) {
+    var guess;
+    var xdiff = Math.abs(source.x - dest.x);
+    var ydiff = Math.abs(source.y - dest.y);
+    if (algorithmConfig.euclidean) {
+        guess = Math.sqrt(xdiff*xdiff + ydiff*ydiff);
+    } else {
+        switch (mapConfig.diagMode) {
+        case 0:
+            guess = xdiff + ydiff;
+            break;
+        case 1:
+            guess = Math.min(xdiff, ydiff) * (mapConfig.diagonalDistance - 1) + Math.max(xdiff, ydiff);
+            break;
+        case 2:
+            if (xdiff < ydiff) {
+                var temp = ydiff;
+                ydiff = xdiff;
+                xdiff = temp;
+            }
+            if (xdiff < 2 * ydiff) {
+                guess = (2 * ydiff - xdiff) * mapConfig.diagonalDistance + (xdiff - ydiff) * mapConfig.slantDistance;
+            } else {
+                guess = ydiff * mapConfig.slantDistance + (xdiff - ydiff * 2)
+            }
+            break;
+        }
+    }
+
+    if (algorithmConfig.useLandmarks) {
+        for (var i = 0; i < landmarks.length; i++) {
+            var candidate = Math.abs(landmarks[i].distances[source.y][source.x] - landmarks[i].distances[dest.y][dest.x]);
+            if (candidate > guess) {
+                guess = candidate;
+            }
+        }
+    }
+
+    return guess;
+}
+
+function isOpen(point) {
+    return 0 <= point.x && point.x < gridWidth && 0 <= point.y && point.y < gridHeight && !map[point.y][point.x];
+}
+
+function neighbors(point) {
+    var ret = [];
+    var east  = { x: point.x + 1, y: point.y    };
+    var west  = { x: point.x - 1, y: point.y    };
+    var north = { x: point.x    , y: point.y + 1};
+    var south = { x: point.x    , y: point.y - 1};
+
+    var eastGood = isOpen(east);
+    var westGood = isOpen(west);
+    var northGood = isOpen(north);
+    var southGood = isOpen(south);
+
+    if (eastGood) {
+        ret.push({ point: east, distance: 1 });
+    }
+    if (westGood) {
+        ret.push({ point: west, distance: 1 });
+    }
+    if (northGood) {
+        ret.push({ point: north, distance: 1 });
+    }
+    if (southGood) {
+        ret.push({ point: south, distance: 1 });
+    }
+    if (mapConfig.diagMode >= 1) {
+        var northeast = { x: point.x + 1, y: point.y + 1 };
+        var southeast = { x: point.x + 1, y: point.y - 1 };
+        var southwest = { x: point.x - 1, y: point.y - 1 };
+        var northwest = { x: point.x - 1, y: point.y + 1 };
+
+        // We don't want to allow diagonals that jump through two touching squares.
+        var northeastGood = (northGood || eastGood) && isOpen(northeast);
+        var southeastGood = (southGood || eastGood) && isOpen(southeast);
+        var southwestGood = (southGood || westGood) && isOpen(southwest);
+        var northwestGood = (northGood || westGood) && isOpen(northwest);
+
+        if (northeastGood) {
+            ret.push({ point: northeast, distance: mapConfig.diagonalDistance });
+        }
+        if (southeastGood) {
+            ret.push({ point: southeast, distance: mapConfig.diagonalDistance });
+        }
+        if (southwestGood) {
+            ret.push({ point: southwest, distance: mapConfig.diagonalDistance });
+        }
+        if (northwestGood) {
+            ret.push({ point: northwest, distance: mapConfig.diagonalDistance });
+        }
+
+        if (mapConfig.diagMode >= 2) {
+            var nne = { x: point.x + 1, y: point.y + 2 };
+            var nee = { x: point.x + 2, y: point.y + 1 };
+            var see = { x: point.x + 2, y: point.y - 1 };
+            var sse = { x: point.x + 1, y: point.y - 2 };
+            var ssw = { x: point.x - 1, y: point.y - 2 };
+            var sww = { x: point.x - 2, y: point.y - 1 };
+            var nww = { x: point.x - 2, y: point.y + 1 };
+            var nnw = { x: point.x - 1, y: point.y + 2 };
+
+            var nneGood = northGood && northeastGood && isOpen(nne);
+            var neeGood = eastGood && northeastGood && isOpen(nee);
+            var seeGood = eastGood && southeastGood && isOpen(see);
+            var sseGood = southGood && southeastGood && isOpen(sse);
+            var sswGood = southGood && southwestGood && isOpen(ssw);
+            var swwGood = westGood && southwestGood && isOpen(sww);
+            var nwwGood = westGood && northwestGood && isOpen(nww);
+            var nnwGood = northGood && northwestGood && isOpen(nnw);
+
+            if (nneGood) {
+                ret.push({ point: nne, distance: mapConfig.slantDistance });
+            }
+            if (neeGood) {
+                ret.push({ point: nee, distance: mapConfig.slantDistance });
+            }
+            if (seeGood) {
+                ret.push({ point: see, distance: mapConfig.slantDistance });
+            }
+            if (sseGood) {
+                ret.push({ point: sse, distance: mapConfig.slantDistance });
+            }
+            if (sswGood) {
+                ret.push({ point: ssw, distance: mapConfig.slantDistance });
+            }
+            if (swwGood) {
+                ret.push({ point: sww, distance: mapConfig.slantDistance });
+            }
+            if (nwwGood) {
+                ret.push({ point: nww, distance: mapConfig.slantDistance });
+            }
+            if (nnwGood) {
+                ret.push({ point: nnw, distance: mapConfig.slantDistance });
+            }
+        }
+    }
+    return ret;
+}
+
+function doNew() {
+    mapRandoms = genArray(600, function(_y) {
+        return genArray(800, function(_x) {
+            return Math.random();
+        });
+    });
+}
+
+function doReset() {
+    switch (walls) {
+    case 0:
+        map = genMap(function(x, y) { return mapRandoms[Math.round(y * squareSize)][Math.round(x * squareSize)] < density; });
+        break;
+    case 1:
+        map = genMap(function(x, y) { return mapRandoms[Math.round(y * squareSize)][Math.round(x * squareSize)] < density; });
+        for (var i = 0; i < 3; i++) {
+            map = genMap(function(x, y) {
+                var nborCount = 0;
+                for (var dx = -1; dx <= 1; dx++) {
+                    for (var dy = -1; dy <= 1; dy++) {
+                        if (isOpen({ x: x + dx, y: y + dy })) {
+                            nborCount++;
+                        }
+                    }
+                }
+
+                return nborCount < 5;
+            });
+        }
+        break;
+    case 2:
+        map = genMap(function(x, y) { return false; });
+        iterGrid(function(x, y) {
+            if (mapRandoms[Math.round(y * squareSize)][Math.round(x * squareSize)] < density / 11) {
+                var dx;
+                var dy;
+                if (Math.random() < 0.5) {
+                    dx = 1;
+                    dy = 0;
+                } else {
+                    dx = 0;
+                    dy = 1;
+                }
+                map[y][x] = true;
+                for (var offset = -5; offset <= 5; offset++) {
+                    if (isOpen({ x: x + offset * dx, y: y + offset * dy })) {
+                        map[y + offset * dy][x + offset * dx] = true;
+                    }
+                }
+            }
+        });
+        break;
+    }
+    doResetReach();
+
+    if (!isOpen(startPos)) {
+        doResetStartPos();
+    }
+    endPos.x = startPos.x;
+    endPos.y = startPos.y;
+
+    displayData = {
+        visitedCount: 0,
+        examinedCount: 0,
+        repeatCount: 0,
+        totalDistance: Infinity,
+        calculationTime: 0,
+        pathdata: genMap(function(x, y) { return { visited: false, distance: null, previous: null, forward: null, depth: null }; }),
+        pathEnds: [],
+    };
+    bgLayer.width = gridWidth;
+    bgLayer.height = gridHeight;
+    var bgCtx = bgLayer.getContext("2d");
+    var mapImageData = bgCtx.createImageData(gridWidth, gridHeight);
+    iterGrid(function(x, y) {
+        var pixelIndex = (gridWidth * y + x) * 4;
+        if (map[y][x]) {
+            mapImageData.data[pixelIndex    ] = 0x12;
+            mapImageData.data[pixelIndex + 1] = 0x34;
+            mapImageData.data[pixelIndex + 2] = 0x56;
+            mapImageData.data[pixelIndex + 3] = 0xff;
+        } else {
+            mapImageData.data[pixelIndex    ] = 0x56;
+            mapImageData.data[pixelIndex + 1] = 0x78;
+            mapImageData.data[pixelIndex + 2] = 0x9a;
+            mapImageData.data[pixelIndex + 3] = 0xff;
+        }
+    });
+    bgCtx.putImageData(mapImageData, 0, 0);
+}
+
+function doResetStartPos() {
+    var tries = 0;
+    do {
+        startPos.x = Math.floor(Math.random() * gridWidth);
+        startPos.y = Math.floor(Math.random() * gridHeight);
+        if (tries > 1000) {
+            // We almost certainly have a completely full map; fall back to prevent an infinite loop.
+            map[startPos.y][startPos.x] = false;
+        }
+        tries++
+    } while(map[startPos.y][startPos.x]);
+}
+
+function doResetReach() {
+    reach = genMap(function(x, y) { return Infinity; });
+    reachBound = 1;
+    reachDone = false;
+
+    reachWorklist = [];
+    edgeReaches = genMap(function(x, y) {
+        return [[null,     Infinity, null,     Infinity, null],
+                [Infinity, Infinity, Infinity, Infinity, Infinity],
+                [null,     Infinity, null,     Infinity, null],
+                [Infinity, Infinity, Infinity, Infinity, Infinity],
+                [null,     Infinity, null,     Infinity, null]];
+    });
+
+    landmarks = [];
+}
+
+function addLandmark(landmarkPos) {
+    var isVisited = genMap(function(x, y) { return false });
+    var distances = genMap(function(x, y) { return Infinity });
+
+    // We just want to flood the whole map as efficiently as possible, so do Dijkstra with Jump Point Pruning
+    var heap = [{ point: landmarkPos, previous: null, distance: 0, priority: 0 }];
+    while (heap.length > 0) {
+        var item = deleteMin(heap);
+
+        if (isVisited[item.point.y][item.point.x]) {
+            continue;
+        }
+        isVisited[item.point.y][item.point.x] = true;
+
+        distances[item.point.y][item.point.x] = item.distance;
+
+        var nexts;
+        if (item.previous === null) {
+            nexts = neighbors(item.point);
+        } else {
+            nexts = jpsNeighbors(item.point, item.point.x - item.previous.x, item.point.y - item.previous.y);
+        }
+
+        for (var i = 0; i < nexts.length; i++) {
+            insertHeap(heap, { point: nexts[i].point, previous: item.point, distance: item.distance + nexts[i].distance, priority: item.distance + nexts[i].distance });
+        }
+    }
+
+    landmarks.push({ center: { x: landmarkPos.x, y: landmarkPos.y }, distances: distances });
+}
+
+/*
+function isParent(parent, child) {
+    var childPrev = pathdata[child.y][child.x].previous;
+    return (childPrev !== null && childPrev.x === parent.x && childPrev.y === parent.y);
+}
+
+function boundDistance(point1, point2) {
+    var nbors = neighbors(point1);
+    for (var i = 0; i < nbors.length; i++) {
+        if (nbors[i].point.x === point2.x && nbors[i].point.y === point2.y) {
+            return nbors[i].distance;
+        }
+    }
+    return Infinity;
+}
+
+function hasOffBranch(point) {
+    var nbors = neighbors(point);
+    var parent = pathdata[point.y][point.x].previous;
+    for (var i = 0; i < nbors.length; i++) {
+        if (!((parent !== null && nbors[i].point.x === parent.x && nbors[i].point.y == parent.y) || isParent(point, nbors[i].point))) {
+            return true;
+        }
+    }
+    return false;
+}
+*/
+
+// TODO: Actually do something slightly more useful.
+function boundReach() {
+    if (reachWorklist.length == 0) {
+        iterMap(function(x, y) {
+            var nbors = neighbors({ x: x, y: y });
+            for (var i = 0; i < nbors.length; i++) {
+                reachWorklist.push({ start: { x: x, y: y }, end: nbors[i].point, distance: nbors[i].distance });
+            }
+        });
+    }
+
+    var vertexWorklist = [];
+    var count = 0;
+    while (reachWorklist.length > 0 && count < 10000) {
+        count++;
+
+        var item = reachWorklist.pop();
+        var edgeStart = item.start;
+        var edgeEnd = item.end;
+        var edgeDx = item.end.x - item.start.x;
+        var edgeDy = item.end.y - item.start.y;
+
+        var outbound = jpsNeighbors(edgeEnd, edgeDx, edgeDy);
+        var inbound = jpsInboundNeighbors(edgeStart, edgeDx, edgeDy);
+
+        var maxInboundReach = 0;
+        for (var j = 0; j < inbound.length; j++) {
+            var inDx = edgeStart.x - inbound[j].point.x;
+            var inDy = edgeStart.y - inbound[j].point.y;
+            var candidate = edgeReaches[inbound[j].point.y][inbound[j].point.x][inDy + 2][inDx + 2];
+            if (candidate > maxInboundReach) {
+                maxInboundReach = candidate;
+            }
+        }
+
+        var maxOutboundReach = 0;
+        for (var j = 0; j < outbound.length; j++) {
+            var outDx = outbound[j].point.x - edgeEnd.x;
+            var outDy = outbound[j].point.y - edgeEnd.y;
+            var candidate = edgeReaches[edgeEnd.y][edgeEnd.x][outDy + 2][outDx + 2];
+            if (candidate > maxOutboundReach) {
+                maxOutboundReach = candidate;
+            }
+        }
+
+        var newReach = Math.min(maxInboundReach, maxOutboundReach) + item.distance;
+        if (newReach < edgeReaches[edgeStart.y][edgeStart.x][edgeDy + 2][edgeDx + 2]) {
+            edgeReaches[edgeStart.y][edgeStart.x][edgeDy + 2][edgeDx + 2] = newReach;
+            if (reach[edgeStart.y][edgeStart.x] !== -1) {
+                vertexWorklist.push(edgeStart);
+                reach[edgeStart.y][edgeStart.x] = -1;
+            }
+            if (reach[edgeEnd.y][edgeEnd.x] !== -1) {
+                vertexWorklist.push(edgeEnd);
+                reach[edgeEnd.y][edgeEnd.x] = -1;
+            }
+            for (var i = 0; i < inbound.length; i++) {
+                reachWorklist.push({ start: inbound[i].point, end: edgeStart, distance: inbound[i].distance });
+            }
+            for (var i = 0; i < outbound.length; i++) {
+                reachWorklist.push({ start: edgeEnd, end: outbound[i].point, distance: outbound[i].distance });
+            }
+        }
+    }
+
+    // Convert edge reaches to vertex reaches
+    for (var v = 0; v < vertexWorklist.length; v++) {
+        var point = vertexWorklist[v];
+        var nbors = neighbors(point);
+        var maxReach = 0;
+        for (var i = 0; i < nbors.length; i++) {
+            var inDx = point.x - nbors[i].point.x;
+            var inDy = point.y - nbors[i].point.y;
+            var inReach = edgeReaches[nbors[i].point.y][nbors[i].point.x][inDy + 2][inDx + 2];
+
+            var outbound = jpsNeighbors(point, inDx, inDy);
+            for (var j = 0; j < outbound.length; j++) {
+                var outDx = outbound[j].point.x - point.x;
+                var outDy = outbound[j].point.y - point.y;
+                var outReach = edgeReaches[point.y][point.x][outDy + 2][outDx + 2];
+
+                var pathReach = Math.min(inReach, outReach);
+                if (pathReach > maxReach) {
+                    maxReach = pathReach;
+                }
+            }
+        }
+        reach[point.y][point.x] = maxReach;
+    };
+
+    if (reachWorklist.length === 0) {
+        reachDone = true;
+    }
+
+    /*
+    var childCounts = genMap(function(x, y) { return 0; });
+    iterMap(function(x, y) {
+        var prev = pathdata[y][x].previous;
+        if (prev !== null) {
+            childCounts[prev.y][prev.x]++;
+        }
+    });
+    var subTreeDepth = genMap(function(x, y) { return reach[y][x]; });
+    var lcaDistance = genMap(function(x, y) { return Infinity; });
+    var splitDistance = genMap(function(x, y) { return Infinity; });
+
+    var worklist = [];
+    iterMap(function(x, y) {
+        // TODO: better support for bidirectional?
+        if (pathdata[y][x].visited && pathdata[y][x].forward && childCounts[y][x] == 0) {
+            worklist.push({ x: x, y: y });
+        }
+    });
+    while (worklist.length > 0) {
+        var item = worklist.pop();
+        var nbors = neighbors(item);
+        var parent = pathdata[item.y][item.x].previous;
+
+        var worst = 0;
+        var nonParents = [];
+        for (var i = 0; i < nbors.length; i++) {
+            if (parent !== null && nbors[i].point.x === parent.x && nbors[i].point.y === parent.y) {
+                continue;
+            }
+            nonParents.push(nbors[i]);
+            var pdata = pathdata[nbors[i].point.y][nbors[i].point.x];
+            if (pdata.visited && pdata.forward && !isParent(item, nbors[i].point)) {
+                // This node borders a different branch of the tree. Ideally, we'd find the least common ancestor and do some nice stuff there.
+                // TODO: figure out something more precise.
+                var pointA = item;
+                var pointB = nbors[i].point;
+                while (pathdata[pointA.y][pointA.x].depth > pathdata[pointB.y][pointB.x].depth) {
+                    pointA = pathdata[pointA.y][pointA.x].previous;
+                    if (hasOffBranch(pointA)) {
+                        splitDistance[item.y][item.x] = Math.min(splitDistance[item.y][item.x], pathdata[pointA.y][pointA.x].distance);
+                    }
+                }
+                while (pathdata[pointA.y][pointA.x].depth < pathdata[pointB.y][pointB.x].depth) {
+                    pointB = pathdata[pointB.y][pointB.x].previous;
+                }
+                var dist = 0;
+                while (true) {
+                    if (pointA.x === pointB.x && pointA.y === pointB.y) {
+                        dist = pathdata[pointA.y][pointA.x].distance;
+                        break;
+                    }
+                    pointA = pathdata[pointA.y][pointA.x].previous;
+                    pointB = pathdata[pointB.y][pointB.x].previous;
+                    if (hasOffBranch(pointA)) {
+                        splitDistance[item.y][item.x] = Math.min(splitDistance[item.y][item.x], pathdata[pointA.y][pointA.x].distance);
+                    }
+                }
+                lcaDistance[item.y][item.x] = Math.min(lcaDistance[item.y][item.x], dist);
+                continue;
+            }
+            worst = Math.max(worst, subTreeDepth[nbors[i].point.y][nbors[i].point.x] + nbors[i].distance);
+            lcaDistance[item.y][item.x] = Math.min(lcaDistance[item.y][item.x], lcaDistance[nbors[i].point.y][nbors[i].point.x]);
+            splitDistance[item.y][item.x] = Math.min(splitDistance[item.y][item.x], splitDistance[nbors[i].point.y][nbors[i].point.x]);
+        }
+        subTreeDepth[item.y][item.x] = Math.min(reach[item.y][item.x], worst);
+
+        if (nbors.length <= 1) {
+            reach[item.y][item.x] = 0;
+        } else if (pathdata[item.y][item.x].distance < splitDistance[item.y][item.x]) {
+            var crossReach;
+            if (nonParents.length <= 1) {
+                crossReach = 0;
+            } else if (lcaDistance[item.y][item.x] === Infinity) {
+                crossReach = subTreeDepth[item.y][item.x];
+            } else {
+                Array.sort(nonParents, function(n1, n2) {
+                    return ((reach[n2.point.y][n2.point.x] + n2.distance) - (reach[n1.point.y][n1.point.x] + n1.distance));
+                });
+                var crossReach = 0;
+                for (var smaller = 1; smaller < nonParents.length; smaller++) {
+                    for (var larger = 0; larger < smaller; larger++) {
+                        if (boundDistance(nonParents[smaller].point, nonParents[larger].point) >= nonParents[smaller].distance + nonParents[larger].distance) {
+                            crossReach = reach[nonParents[smaller].point.y][nonParents[smaller].point.x] + nonParents[smaller].distance;
+                            break;
+                        }
+                    }
+                    if (crossReach !== 0) {
+                        break;
+                    }
+                }
+            }
+            var proposed = Math.max(pathdata[item.y][item.x].distance - lcaDistance[item.y][item.x], subTreeDepth[item.y][item.x], crossReach);
+            reach[item.y][item.x] = Math.min(reach[item.y][item.x], proposed);
+        }
+
+        if (parent !== null) {
+            childCounts[parent.y][parent.x]--;
+            if (childCounts[parent.y][parent.x] === 0) {
+                worklist.push(parent);
+            }
+        }
+    }
+    */
+}
+
+function adjust(item) {
+    // A* search operates by performing Dijkstra's algorithm on a modified graph, where every vertex is given a "potential".
+    // The (notably, directed) edge from A to B is labeled with the updated distance
+    // d'(A, B) = d(A, B) - p(A) + p(B)
+    // where p is the potential function. Since these values are only dependent on the vertices, the length of a path is a telescoping sum,
+    // and so the length of a path depends only on its original length and the endpoints. For a path P from A to B,
+    // d'(P) = d(P) - p(A) + p(B)
+
+    // The standard potential function is given by an estimated distance to the endpoint, since this lowers the cost of edges going towards
+    // the endpoint, making search faster. However, this fails dramatically in the bidirectional case - the search out from the endpoint
+    // gets no useful information from the nearness to the endpoint.
+    var potential;
+    var startPotential;
+    var endPotential;
+    switch (algorithmConfig.potentialFunc) {
+        case 0:
+            // Normal Dijkstra is equivalent to a potential of 0, which doesn't modify the graph.
+            potential = 0;
+            startPotential = 0;
+            endPotential = 0;
+            break;
+        case 1:
+            potential = heuristic(item.point, endPos);
+            startPotential = heuristicTotalDist;
+            endPotential = 0;
+            break;
+        case 2:
+            // Dijkstra requires that all edges have nonnegative weight to work properly. In the context of potential functions, this means
+            // that whenever A and B are connected by an edge, |p(A) - p(B)| must be less than or equal to d(A, B).
+            // While this is true for the basic, standard estimate, combining the distance to the start and the distance to the end, the change
+            // between adjacent might be up to twice the allowed change (since both of the distances might change by the maximum). Therefore,
+            // we need to divide by 2.
+            potential = (heuristic(item.point, endPos) - heuristic(item.point, startPos))/2;
+            startPotential = heuristicTotalDist / 2;
+            endPotential = -heuristicTotalDist / 2;
+            break;
+    }
+    // On a directed graph, the reverse search needs to be traversing the dual graph where edges are reversed. For simplicity, we just
+    // implement this by negating the potential. Note that
+    // d'_rev(A, B) = d(A, B) - (-p(A)) + (-p(B)
+    //              = d(A, B) + p(A) - p(B)
+    //              = d(B, A) - p(B) + p(A)
+    // So this produces the correct edge weights for the dual graph.
+    if (item.forward) {
+        item.priority = item.distance + potential - endPotential;
+    } else {
+        item.priority = item.distance + startPotential - potential;
+    }
+    if (algorithmConfig.prioritize) {
+        var target;
+        if (item.forward) {
+            target = endPos;
+        } else {
+            target = startPos;
+        }
+        var xdiff = Math.abs(target.x - item.point.x);
+        var ydiff = Math.abs(target.y - item.point.y);
+        var euclideanDist = Math.sqrt(xdiff * xdiff + ydiff * ydiff);
+        item.priority += heuristic(target, item.point) * 1e-10;
+        item.priority += euclideanDist * 1e-15;
+    }
+    return item;
+}
+
+function jpsCardinal(basePoint, dx, dy, forward, baseDistance, state) {
+    if (!isOpen({ x: basePoint.x + dx, y: basePoint.y + dy })) {
+        return null;
+    }
+
+    for (var step = 1; step <= jumpBound; step++) {
+        var candidate = { x: basePoint.x + step * dx, y: basePoint.y + step * dy };
+        state.pathdata[candidate.y][candidate.x].examined = true;
+        state.examinedCount++;
+
+        if (algorithmConfig.reach !== 0) {
+            var forwardReach;
+            var backwardReach;
+            if (algorithmConfig.reach === 1) {
+                // Vertex reach
+                forwardReach = reach[candidate.y][candidate.x];
+                backwardReach = forwardReach;
+            } else {
+                // Edge reach
+                backwardReach = edgeReaches[candidate.y - dy][candidate.x - dx][dy + 2][dx + 2];
+                forwardReach = backwardReach - 1;
+            }
+            if (backwardReach < baseDistance + step) {
+                if (algorithmConfig.bidi || forwardReach < heuristic(candidate, endPos)) {
+                    return null;
+                }
+            }
+        }
+
+        var forwardP = { x: basePoint.x + (step + 1) * dx, y: basePoint.y + (step + 1) * dy };
+        if (isOpen(forwardP)) {
+            var leftP = { x: basePoint.x + step * dx + dy, y: basePoint.y + step * dy - dx };
+            var rightP = { x: basePoint.x + step * dx - dy, y: basePoint.y + step * dy + dx };
+            var leftForwardP = { x: basePoint.x + (step + 1) * dx + dy, y: basePoint.y + (step + 1) * dy - dx };
+            var rightForwardP = { x: basePoint.x + (step + 1) * dx - dy, y: basePoint.y + (step + 1) * dy + dx };
+
+            if ((!isOpen(leftP) && isOpen(leftForwardP)) ||
+                (!isOpen(rightP) && isOpen(rightForwardP)) ||
+                state.pathdata[candidate.y][candidate.x].visited) {
+
+                return { point: candidate, distance: step };
+            }
+        } else if (state.pathdata[candidate.y][candidate.x].visited) {
+            return { point: candidate, distance: step };
+        } else {
+            return null;
+        }
+    }
+
+    return { point: { x: basePoint.x + jumpBound * dx, y: basePoint.y + jumpBound * dy }, distance: jumpBound };
+}
+
+function jpsDiagonal(basePoint, dx, dy, forward, baseDistance, state) {
+    for (var step = 1; step <= jumpBound; step++) {
+        var candidate = { x: basePoint.x + step * dx, y: basePoint.y + step * dy };
+        if (isOpen(candidate)) {
+            state.pathdata[candidate.y][candidate.x].examined = true;
+            state.examinedCount++;
+
+            if (algorithmConfig.reach !== 0) {
+                var forwardReach;
+                var backwardReach;
+                if (algorithmConfig.reach === 1) {
+                    // Vertex reach
+                    forwardReach = reach[candidate.y][candidate.x];
+                    backwardReach = forwardReach;
+                } else {
+                    // Edge reach
+                    backwardReach = edgeReaches[candidate.y - dy][candidate.x - dx][dy + 2][dx + 2];
+                    forwardReach = backwardReach - mapConfig.diagonalDistance;
+                }
+                if (backwardReach < baseDistance + step * mapConfig.diagonalDistance) {
+                    if (algorithmConfig.bidi || forwardReach < heuristic(candidate, endPos)) {
+                        return null;
+                    }
+                }
+            }
+
+            if (state.pathdata[candidate.y][candidate.x].visited && state.pathdata[candidate.y][candidate.x].forward === forward) {
+                return null;
+            }
+
+            var leftBackP = { x: candidate.x - (dx - dy) / 2, y: candidate.y - (dx + dy) / 2 };
+            var rightBackP = { x: candidate.x - (dx + dy) / 2, y: candidate.y + (dx - dy) / 2 };
+            if (!isOpen(leftBackP) && !isOpen(rightBackP)) {
+               // We jumped through a barrier
+               return null;
+            }
+
+            var leftP = { x: candidate.x + dy, y: candidate.y - dx };
+            var rightP = { x: candidate.x - dy, y: candidate.y + dx };
+            var leftForwardP = { x: candidate.x + (dx + dy) / 2, y: candidate.y - (dx - dy) / 2 };
+            var rightForwardP = { x: candidate.x + (dx - dy) / 2, y: candidate.y + (dx + dy) / 2 };
+
+            if ((!isOpen(leftBackP) && isOpen(leftP) && isOpen(leftForwardP)) ||
+                (!isOpen(rightBackP) && isOpen(rightP) && isOpen(rightForwardP)) ||
+                jpsCardinal(candidate, dx, 0, forward, baseDistance + step * mapConfig.diagonalDistance, state) !== null ||
+                jpsCardinal(candidate, 0, dy, forward, baseDistance + step * mapConfig.diagonalDistance, state) !== null ||
+                state.pathdata[candidate.y][candidate.x].visited) {
+
+                return { point: candidate, distance: step * mapConfig.diagonalDistance };
+            }
+        } else {
+            return null;
+        }
+    }
+
+    return { point: { x: basePoint.x + jumpBound * dx, y: basePoint.y + jumpBound * dy }, distance: jumpBound * mapConfig.diagonalDistance };
+}
+
+function maybeAdd(item, arr) {
+    if (item !== null) {
+        arr.push(item);
+    }
+}
+
+function jpsNeighbors(basePoint, dx, dy) {
+    ret = [];
+
+    var leftP = { x: basePoint.x + dy, y: basePoint.y - dx };
+    var rightP = { x: basePoint.x - dy, y: basePoint.y + dx };
+    var forwardP = { x: basePoint.x + dx, y: basePoint.y + dy };
+
+    switch (mapConfig.diagMode) {
+    case 0:
+        //   x
+        // x . x
+        //   .
+
+        // # o
+        // . . x
+
+        if (isOpen(forwardP)) {
+            ret.push({ point: forwardP, distance: 1 });
+        }
+        if (dx === 0) {
+            // Vertical movement
+            if (isOpen(leftP)) {
+                ret.push({ point: leftP, distance: 1 });
+            }
+            if (isOpen(rightP)) {
+                ret.push({ point: rightP, distance: 1 });
+            }
+        } else {
+            var leftBackP = { x: basePoint.x - dx + dy, y: basePoint.y - dy - dx };
+            var rightBackP = { x: basePoint.x - dx - dy, y: basePoint.y - dy + dx };
+            if (!isOpen(leftBackP) && isOpen(leftP)) {
+                ret.push({ point: leftP, distance: 1 });
+            }
+            if (!isOpen(rightBackP) && isOpen(rightP)) {
+                ret.push({ point: rightP, distance: 1 });
+            }
+        }
+        break;
+    case 1:
+        //   # o
+        // . . x
+
+        // o x x
+        // # . x
+        // .
+
+        if (dx == 0 || dy == 0) {
+            // Cardinal movement
+            if (isOpen(forwardP)) {
+                ret.push({ point: forwardP, distance: 1 });
+
+                if (!isOpen(leftP)) {
+                    var leftForwardP = { x: basePoint.x + dx + dy, y: basePoint.y + dy - dx };
+                    if (isOpen(leftForwardP)) {
+                        ret.push({ point: leftForwardP, distance: mapConfig.diagonalDistance });
+                    }
+                }
+
+                if (!isOpen(rightP)) {
+                    var rightForwardP = { x: basePoint.x + dx - dy, y: basePoint.y + dy + dx };
+                    if (isOpen(rightForwardP)) {
+                        ret.push({ point: rightForwardP, distance: mapConfig.diagonalDistance });
+                    }
+                }
+            }
+        } else {
+            // Diagonal movement
+            var leftForwardP = { x: basePoint.x + (dx + dy) / 2, y: basePoint.y - (dx - dy) / 2 };
+            var rightForwardP = { x: basePoint.x + (dx - dy) / 2, y: basePoint.y + (dx + dy) / 2 };
+            if (isOpen(leftForwardP)) {
+                ret.push({ point: leftForwardP, distance: 1 });
+            
+                var leftBackP = { x: basePoint.x - (dx - dy) / 2, y: basePoint.y - (dx + dy) / 2 };
+                if (!isOpen(leftBackP) && isOpen(leftP)) {
+                    ret.push({ point: leftP, distance: mapConfig.diagonalDistance });
+                }
+            }
+            if (isOpen(rightForwardP)) {
+                ret.push({ point: rightForwardP, distance: 1 });
+
+                var rightBackP = { x: basePoint.x - (dx + dy) / 2, y: basePoint.y + (dx - dy) / 2 };
+                if (!isOpen(rightBackP) && isOpen(rightP)) {
+                    ret.push({ point: rightP, distance: mapConfig.diagonalDistance });
+                }
+            }
+
+            if (isOpen(forwardP) && (isOpen(leftForwardP) || isOpen(rightForwardP))) {
+                ret.push({ point: forwardP, distance: mapConfig.diagonalDistance });
+            }
+        }
+        break;
+    case 2:
+        //   # o o
+        // . . x
+
+        // o   o
+        // o o x
+        // # .
+        // .
+
+        // .   # o o
+        //     . x
+        //       x x
+
+        if (dx == 0 || dy == 0) {
+            // Cardinal movement
+            if (isOpen(forwardP)) {
+                ret.push({ point: forwardP, distance: 1 });
+
+                if (!isOpen(leftP)) {
+                    var leftForwardP = { x: basePoint.x + dx + dy, y: basePoint.y + dy - dx };
+                    if (isOpen(leftForwardP)) {
+                        ret.push({ point: leftForwardP, distance: mapConfig.diagonalDistance });
+
+                        var leftSlantP = { x: basePoint.x + dx * 2 + dy, y: basePoint.y + dy * 2 - dx };
+                        if (isOpen(leftSlantP)) {
+                            ret.push({ point: leftSlantP, distance: mapConfig.slantDistance });
+                        }
+                    }
+                }
+
+                if (!isOpen(rightP)) {
+                    var rightForwardP = { x: basePoint.x + dx - dy, y: basePoint.y + dy + dx };
+                    if (isOpen(rightForwardP)) {
+                        ret.push({ point: rightForwardP, distance: mapConfig.diagonalDistance });
+
+                        var rightSlantP = { x: basePoint.x + dx * 2 - dy, y: basePoint.y + dy * 2 + dx };
+                        if (isOpen(rightSlantP)) {
+                            ret.push({ point: rightSlantP, distance: mapConfig.slantDistance });
+                        }
+                    }
+                }
+            }
+        } else if (Math.abs(dx) == 1 && Math.abs(dy) == 1) {
+            // Diagonal movement
+            var leftForwardP = { x: basePoint.x + (dx + dy) / 2, y: basePoint.y - (dx - dy) / 2 };
+            var rightForwardP = { x: basePoint.x + (dx - dy) / 2, y: basePoint.y + (dx + dy) / 2 };
+
+            var forwardBlocked = true;
+            if (isOpen(leftForwardP)) {
+                forwardBlocked = false;
+
+                var leftBackP = { x: basePoint.x - (dx - dy) / 2, y: basePoint.y - (dx + dy) / 2 };
+                if (!isOpen(leftBackP)) {
+                    ret.push({ point: leftForwardP, distance: 1 });
+            
+                    if (isOpen(leftP)) {
+                        ret.push({ point: leftP, distance: mapConfig.diagonalDistance });
+
+                        var leftHardSlantP = { x: basePoint.x + dx * 0.5 + dy * 1.5, y: basePoint.y - dx * 1.5 + dy * 0.5 }
+                        if (isOpen(leftHardSlantP)) {
+                            ret.push({ point: leftHardSlantP, distance: mapConfig.slantDistance });
+                        }
+                    }
+
+                    var leftLightSlantP = { x: basePoint.x + dx * 1.5 + dy * 0.5, y: basePoint.y - dx * 0.5 + dy * 1.5 };
+                    if (isOpen(forwardP) && isOpen(leftLightSlantP)) {
+                        ret.push({ point: leftLightSlantP, distance: mapConfig.slantDistance });
+                    }
+                }
+            }
+            if (isOpen(rightForwardP)) {
+                forwardBlocked = false;
+
+                var rightBackP = { x: basePoint.x - (dx + dy) / 2, y: basePoint.y + (dx - dy) / 2 };
+                if (!isOpen(rightBackP)) {
+                    ret.push({ point: rightForwardP, distance: 1 });
+
+                    if (isOpen(rightP)) {
+                        ret.push({ point: rightP, distance: mapConfig.diagonalDistance });
+
+                        var rightHardSlantP = { x: basePoint.x + dx * 0.5 - dy * 1.5, y: basePoint.y + dx * 1.5 + dy * 0.5 };
+                        if (isOpen(rightHardSlantP)) {
+                            ret.push({ point: rightHardSlantP, distance: mapConfig.slantDistance });
+                        }
+                    }
+
+                    var rightLightSlantP = { x: basePoint.x + dx * 1.5 - dy * 0.5, y: basePoint.y + dx * 0.5 + dy * 1.5 };
+                    if (isOpen(forwardP) && isOpen(rightLightSlantP)) {
+                        ret.push({ point: rightLightSlantP, distance: mapConfig.slantDistance });
+                    }
+                }
+            }
+
+            if (isOpen(forwardP) && !forwardBlocked) {
+                ret.push({ point: forwardP, distance: mapConfig.diagonalDistance });
+            }
+        } else {
+            // Slant movement
+            var shortDx, shortDy, longDx, longDy;
+            if (Math.abs(dx) == 1) {
+                shortDx = dx;
+                shortDy = 0;
+                longDx = 0;
+                longDy = dy * 0.5;
+            } else {
+                shortDx = 0;
+                shortDy = dy;
+                longDx = dx * 0.5;
+                longDy = 0;
+            }
+
+            var diagBlocked = true;
+            var cardinalP = { x: basePoint.x + longDx, y: basePoint.y + longDy };
+            if (isOpen(cardinalP)) {
+                diagBlocked = false;
+                ret.push({ point: cardinalP, distance: 1 });
+
+                if (!isOpen({ x: basePoint.x - shortDx, y: basePoint.y - shortDy})) {
+                    var sideDiagP = { x: basePoint.x - shortDx + longDx, y: basePoint.y - shortDy + longDy };
+                    if (isOpen(sideDiagP)) {
+                        ret.push({ point: sideDiagP, distance: mapConfig.diagonalDistance });
+
+                        var sideSlantP = { x: basePoint.x - shortDx + longDx * 2, y: basePoint.y - shortDy + longDy * 2 };
+                        if (isOpen(sideSlantP)) {
+                            ret.push({ point: sideSlantP, distance: mapConfig.slantDistance });
+                        }
+                    }
+                }
+            } else if (isOpen({ x: basePoint.x + shortDx, y: basePoint.y + shortDy })) {
+                diagBlocked = false;
+            }
+
+            var diagP = { x: basePoint.x + shortDx + longDx, y: basePoint.y + shortDy + longDy };
+            if (!diagBlocked && isOpen(diagP)) {
+                ret.push({ point: diagP, distance: mapConfig.diagonalDistance });
+            }
+            if (isOpen(cardinalP) && isOpen(diagP) && isOpen(forwardP)) {
+                ret.push({ point: forwardP, distance: mapConfig.slantDistance });
+            }
+        }
+        break;
+    }
+
+    return ret;
+}
+
+function jpsInboundNeighbors(basePoint, dx, dy) {
+    ret = [];
+
+    var backP = { x: basePoint.x - dx, y: basePoint.y - dy };
+    var leftP = { x: basePoint.x + dy, y: basePoint.y - dx };
+    var rightP = { x: basePoint.x - dy, y: basePoint.y + dx };
+
+    switch (mapConfig.diagMode) {
+    case 0:
+        // # .
+        // o .
+        //   x
+
+        //   x
+        // x . .
+        //   x
+
+        if (isOpen(backP)) {
+            ret.push({ point: backP, distance: 1 });
+        }
+        if (dx === 0) {
+            // Vertical movement
+            var leftForwardP = { x: basePoint.x + dx + dy, y: basePoint.y + dy - dx };
+            var rightForwardP = { x: basePoint.x + dx - dy, y: basePoint.y + dy + dx };
+
+            if (!isOpen(leftForwardP) && isOpen(leftP)) {
+                ret.push({ point: leftP, distance: 1 });
+            }
+            if (!isOpen(rightForwardP) && isOpen(rightP)) {
+                ret.push({ point: rightP, distance: 1 });
+            }
+        } else {
+            // Horizontal movement
+            if (isOpen(leftP)) {
+                ret.push({ point: leftP, distance: 1 });
+            }
+            if (isOpen(rightP)) {
+                ret.push({ point: rightP, distance: 1 });
+            }
+        }
+        break;
+    case 1:
+        //   .
+        //   .
+        // x x x
+
+        // o # .
+        // o .
+        // x
+
+        if (dx == 0 || dy == 0) {
+            // Cardinal movement
+            var leftBackP = { x: basePoint.x - dx + dy, y: basePoint.y - dy - dx };
+            var rightBackP = { x: basePoint.x - dx - dy, y: basePoint.y - dy + dx };
+            if (isOpen(backP)) {
+                ret.push({ point: backP, distance: 1 });
+            }
+            if (isOpen(leftBackP) && (isOpen(backP) || isOpen(leftP))) {
+                ret.push({ point: leftBackP, distance: mapConfig.diagonalDistance });
+            }
+            if (isOpen(rightBackP) && (isOpen(backP) || isOpen(rightP))) {
+                ret.push({ point: rightBackP, distance: mapConfig.diagonalDistance });
+            }
+        } else {
+            // Diagonal movement
+            var leftBackP = { x: basePoint.x - (dx - dy) / 2, y: basePoint.y - (dx + dy) / 2 };
+            var rightBackP = { x: basePoint.x - (dx + dy) / 2, y: basePoint.y + (dx - dy) / 2 };
+            var leftForwardP = { x: basePoint.x + (dx + dy) / 2, y: basePoint.y - (dx - dy) / 2 };
+            var rightForwardP = { x: basePoint.x + (dx - dy) / 2, y: basePoint.y + (dx + dy) / 2 };
+
+            if (isOpen(backP) && (isOpen(leftBackP) || isOpen(rightBackP))) {
+                ret.push({ point: backP, distance: mapConfig.diagonalDistance });
+            }
+
+            if (!isOpen(leftForwardP) && isOpen(leftBackP)) {
+                 ret.push({ point: leftBackP, distance: 1 });
+                
+                if (isOpen(leftP)) {
+                    ret.push({ point: leftP, distance: mapConfig.diagonalDistance });
+                }
+            }
+
+            if (!isOpen(rightForwardP) && isOpen(rightBackP)) {
+                ret.push({ point: rightBackP, distance: 1 });
+            
+                if (isOpen(rightP)) {
+                    ret.push({ point: rightP, distance: mapConfig.diagonalDistance });
+               }
+            }
+        }
+        break;
+    case 2:
+        // x o #
+        //   x . .
+        // x
+
+        // o o # .
+        //   o .
+        // x x
+        //   x
+
+        // x
+        //   o .
+        // o o #   .
+
+        // o #
+        //   .
+        //       .
+        if (dx == 0 || dy == 0) {
+            // Cardinal movement
+            if (isOpen(backP)) {
+                ret.push({ point: backP, distance: 1 });
+
+                var leftBackP = { x: basePoint.x - dx + dy, y: basePoint.y - dy - dx };
+                if (isOpen(leftBackP)) {
+                    if (!isOpen(leftP)) {
+                        ret.push({ point: leftBackP, distance: mapConfig.diagonalDistance });
+                    }
+
+                    var leftBackSlantP = { x: basePoint.x - 2 * dx + dy, y: basePoint.y - 2 * dy - dx };
+                    if (isOpen(leftBackSlantP)) {
+                        ret.push({ point: leftBackSlantP, distance: mapConfig.slantDistance });
+                    }
+                }
+
+                var rightBackP = { x: basePoint.x - dx - dy, y: basePoint.y - dy + dx };
+                if (isOpen(rightBackP)) {
+                    if (!isOpen(rightP)) {
+                        ret.push({ point: rightBackP, distance: mapConfig.diagonalDistance });
+                    }
+
+                    var rightBackSlantP = { x: basePoint.x - 2 * dx - dy, y: basePoint.y - 2 * dy + dx };
+                    if (isOpen(rightBackSlantP)) {
+                        ret.push({ point: rightBackSlantP, distance: mapConfig.slantDistance });
+                    }
+                }
+            }
+        } else if (Math.abs(dx) == 1 && Math.abs(dy) == 1) {
+            // Diagonal movement
+            var backGood = false;
+
+            var leftBackP = { x: basePoint.x - (dx - dy) / 2, y: basePoint.y - (dx + dy) / 2 };
+            if (isOpen(leftBackP)) {
+                var leftForwardP = { x: basePoint.x + (dx + dy) / 2, y: basePoint.y - (dx - dy) / 2 };
+                if (!isOpen(leftForwardP)) {
+                    ret.push({ point: leftBackP, distance: 1 });
+
+                    if (isOpen(leftP)) {
+                        ret.push({ point: leftP, distance: mapConfig.diagonalDistance });
+
+                        var leftBackHardSlantP = { x: basePoint.x - dx * 0.5 + dy * 1.5, y: basePoint.y - dx * 1.5 - dy * 0.5 };
+                        if (isOpen(leftBackHardSlantP)) {
+                            ret.push({ point: leftBackHardSlantP, distance: mapConfig.slantDistance });
+                        }
+                    }
+                }
+
+                if (isOpen(backP)) {
+                    backGood = true;
+
+                    var leftBackLightSlantP = { x: basePoint.x - dx * 1.5 + dy * 0.5, y: basePoint.y - dx * 0.5 - dy * 1.5 };
+                    if (isOpen(leftBackLightSlantP)) {
+                        ret.push({ point: leftBackLightSlantP, distance: mapConfig.slantDistance });
+                    }
+                }
+            }
+
+            var rightBackP = { x: basePoint.x - (dx + dy) / 2, y: basePoint.y + (dx - dy) / 2 };
+            if (isOpen(rightBackP)) {
+                var rightForwardP = { x: basePoint.x + (dx - dy) / 2, y: basePoint.y + (dx + dy) / 2 };
+                if (!isOpen(rightForwardP)) {
+                    ret.push({ point: rightBackP, distance: 1 });
+
+                    if (isOpen(rightP)) {
+                        ret.push({ point: rightP, distance: mapConfig.diagonalDistance });
+
+                        var rightBackHardSlantP = { x: basePoint.x - dx * 0.5 - dy * 1.5, y: basePoint.y + dx * 1.5 - dy * 0.5 };
+                        if (isOpen(rightBackHardSlantP)) {
+                            ret.push({ point: rightBackHardSlantP, distance: mapConfig.slantDistance });
+                        }
+                    }
+                }
+
+                if (isOpen(backP)) {
+                    backGood = true;
+
+                    var rightBackLightSlantP = { x: basePoint.x - dx * 1.5 - dy * 0.5, y: basePoint.y + dx * 0.5 - dy * 1.5 };
+                    if (isOpen(rightBackLightSlantP)) {
+                        ret.push({ point: rightBackLightSlantP, distance: mapConfig.slantDistance });
+                    }
+                }
+            }
+
+            if (backGood) {
+                ret.push({ point: backP, distance: mapConfig.diagonalDistance });
+            }
+        } else {
+            // Slant movement
+            var shortDx, shortDy, longDx, longDy;
+            if (Math.abs(dx) == 1) {
+                shortDx = dx;
+                shortDy = 0;
+                longDx = 0;
+                longDy = dy * 0.5;
+            } else {
+                shortDx = 0;
+                shortDy = dy;
+                longDx = dx * 0.5;
+                longDy = 0;
+            }
+
+            var longBackP = { x: basePoint.x - longDx, y: basePoint.y - longDy };
+            if (isOpen(longBackP)) {
+                var diagBackP = { x: basePoint.x - longDx - shortDx, y: basePoint.y - longDy - shortDy };
+                if (isOpen(diagBackP)) {
+                    if (!isOpen({ x: basePoint.x - shortDx, y: basePoint.y - shortDy })) {
+                        ret.push({ point: diagBackP, distance: mapConfig.diagonalDistance });
+                    }
+
+                    if (isOpen(backP)) {
+                        ret.push({ point: backP, distance: mapConfig.slantDistance });
+                    }
+                }
+
+                if (!isOpen({ x: basePoint.x + shortDx, y: basePoint.y + shortDy })) {
+                    ret.push({ point: longBackP, distance: 1 });
+
+                    var diagBackHardP = { x: basePoint.x - longDx + shortDx, y: basePoint.y - longDy + shortDy };
+                    if (isOpen(diagBackHardP)) {
+                        ret.push({ point: diagBackHardP, distance: mapConfig.diagonalDistance });
+
+                        var slantBackP = { x: basePoint.x - 2 * longDx + shortDx, y: basePoint.y - 2 * longDy + shortDy };
+                        if (isOpen(slantBackP)) {
+                            ret.push({ point: slantBackP, distance: mapConfig.slantDistance });
+                        }
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    return ret;
+}
+
+function doRecalculate() {
+    var startTime = Date.now();
+    heuristicTotalDist = heuristic(startPos, endPos);
+
+    var state = {
+        visitedCount: 0,
+        examinedCount: 0,
+        repeatCount: 0,
+        pathdata: genMap(function(x, y) { return { visited: false, distance: null, previous: null, forward: null, depth: null }; })
+    };
+
+    state.pathdata[startPos.y][startPos.x] = {
+        visited: true,
+        forward: true,
+        distance: 0,
+        previous: null
+    };
+    state.pathdata[endPos.y][endPos.x] = {
+        visited: true,
+        forward: false,
+        distance: 0,
+        previous: null
+    };
+
+    var heap = [];
+
+    insertHeap(heap, adjust({ point: startPos, previous: null, distance: 0, forward: true, depth: 0 }));
+    
+    if (algorithmConfig.bidi) {
+        insertHeap(heap, adjust({ point: endPos, previous: null, distance: 0, forward: false, depth: 0 }));
+    }
+    while (heap.length > 0) {
+        var item = deleteMin(heap);
+
+        if (algorithmConfig.reach !== 0) {
+            var forwardReach;
+            var backwardReach;
+            if (algorithmConfig.reach === 1) {
+                // Vertex reach
+                forwardReach = reach[item.point.y][item.point.x];
+                backwardReach = forwardReach;
+            } else if (item.previous !== null) {
+                // Edge reach
+                var dx = item.point.x - item.previous.x;
+                var dy = item.point.y - item.previous.y;
+                if (algorithmConfig.jumpPoint > 1) {
+                    dx = Math.sign(dx);
+                    dy = Math.sign(dy);
+                }
+                backwardReach = edgeReaches[item.previous.y][item.previous.x][dy + 2][dx + 2];
+                forwardReach = backwardReach; // - edgeDistance;
+            }
+            if (backwardReach < item.distance) {
+                if (algorithmConfig.bidi || forwardReach < heuristic(item.point, endPos)) {
+                    state.pathdata[item.point.y][item.point.x].examined = true;
+                    state.examinedCount++
+                    continue;
+                }
+            }
+        }
+
+        if (algorithmConfig.reach !== 0) {
+            if (algorithmConfig.bidi) {
+                if (reach[item.point.y][item.point.x] < item.distance) {
+                    state.pathdata[item.point.y][item.point.x].examined = true;
+                    state.examinedCount++
+                    continue;
+                }
+            } else {
+                if (reach[item.point.y][item.point.x] < item.distance && reach[item.point.y][item.point.x] < heuristic(item.point, endPos)) {
+                    state.pathdata[item.point.y][item.point.x].examined = true;
+                    state.examinedCount++
+                    continue;
+                }
+            }
+        }
+        //console.log("Processing (" + item.point.x + ", " + item.point.y + ")");
+        if (state.pathdata[item.point.y][item.point.x].visited) {
+            //console.log("point (" + item.point.x + ", " + item.point.y + "): " + state.pathdata[item.point.y][item.point.x].forward + " path: " + item.forward + " unequal:" + (state.pathdata[item.point.y][item.point.x].forward !== item.forward) + " test: " + (null === true) + ", " + (null !== true));
+            if (state.pathdata[item.point.y][item.point.x].forward !== item.forward) {
+                //console.log("different!");
+                // FIXME: I think this is an incorrect stopping condition in general.
+                // Consider
+                //
+                //       S ---------------- T
+                //      /         5          \
+                //   2 /                      \ 2
+                //    /                        \
+                //   A ---------- B ------------ C
+                //         6             6
+                //
+                // The bidirectional search from A to C will first meet at B although that isn't the shortest path.
+                //
+                // With Jump Point Search, this situation may actually arise, though rarely.
+                state.pathEnds = [item.point];
+                if (item.previous !== null) {
+                    state.pathEnds.push(item.previous);
+                }
+                state.totalDistance = item.distance + state.pathdata[item.point.y][item.point.x].distance;
+                state.calculationTime = Date.now() - startTime;
+                return state;
+            } else {
+                var base = item.forward ? startPos : endPos;
+                if (item.point.x !== base.x || item.point.y !== base.y) {
+                    //console.log("REPEAT (" + item.point.x + ", " + item.point.y + ")   forward=" + item.forward);
+                    state.repeatCount++;
+                    continue;
+                } else {
+                    //console.log("At start!");
+                }
+            }
+        } else {
+            state.visitedCount++;
+        }
+
+        state.pathdata[item.point.y][item.point.x].previous = item.previous;
+        state.pathdata[item.point.y][item.point.x].distance = item.distance;
+        state.pathdata[item.point.y][item.point.x].forward = item.forward;
+        state.pathdata[item.point.y][item.point.x].visited = true;
+        state.pathdata[item.point.y][item.point.x].processTime = state.visitedCount;
+        state.pathdata[item.point.y][item.point.x].depth = item.depth;
+
+        var nexts;
+        switch (algorithmConfig.jumpPoint) {
+        case 0:
+            nexts = neighbors(item.point);
+            break;
+        case 1:
+            // FIXME: handle when we're not allowed diagonals
+            if (item.previous === null) {
+                nexts = neighbors(item.point);
+            } else {
+                var dx = item.point.x - item.previous.x;
+                var dy = item.point.y - item.previous.y;
+                if (algorithmConfig.dualJps) {
+                    nexts = jpsInboundNeighbors(item.point, -dx, -dy);
+                } else {
+                    nexts = jpsNeighbors(item.point, dx, dy);
+                }
+            }
+            break;
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+            switch (algorithmConfig.jumpPoint) {
+            case 2:
+                jumpBound = 3;
+                break;
+            case 3:
+                jumpBound = 10;
+                break;
+            case 4:
+                jumpBound = 50;
+                break;
+            case 5:
+                jumpBound = Infinity;
+                break;
+            }
+            // FIXME: handle when we're not allowed diagonals
+            nexts = [];
+            if (item.previous === null) {
+                maybeAdd(jpsCardinal(item.point,  1,  0, item.forward, item.distance, state), nexts);
+                maybeAdd(jpsCardinal(item.point,  0,  1, item.forward, item.distance, state), nexts);
+                maybeAdd(jpsCardinal(item.point, -1,  0, item.forward, item.distance, state), nexts);
+                maybeAdd(jpsCardinal(item.point,  0, -1, item.forward, item.distance, state), nexts);
+                maybeAdd(jpsDiagonal(item.point,  1,  1, item.forward, item.distance, state), nexts);
+                maybeAdd(jpsDiagonal(item.point,  1, -1, item.forward, item.distance, state), nexts);
+                maybeAdd(jpsDiagonal(item.point, -1, -1, item.forward, item.distance, state), nexts);
+                maybeAdd(jpsDiagonal(item.point, -1,  1, item.forward, item.distance, state), nexts);
+            } else {
+                var dx = Math.sign(item.point.x - item.previous.x);
+                var dy = Math.sign(item.point.y - item.previous.y);
+
+                var leftP = { x: item.point.x + dy, y: item.point.y - dx };
+                var rightP = { x: item.point.x - dy, y: item.point.y + dx };
+
+                if (dx == 0 || dy == 0) {
+                    // Cardinal movement
+                    maybeAdd(jpsCardinal(item.point, dx, dy, item.forward, item.distance, state), nexts);
+
+                    var leftForwardP = { x: item.point.x + dx + dy, y: item.point.y + dy - dx };
+                    var rightForwardP = { x: item.point.x + dx - dy, y: item.point.y + dy + dx };
+                    if (!isOpen(leftP) && isOpen(leftForwardP)) {
+                        nexts.push({ point: leftForwardP, distance: mapConfig.diagonalDistance });
+                    }
+                    if (!isOpen(rightP) && isOpen(rightForwardP)) {
+                        nexts.push({ point: rightForwardP, distance: mapConfig.diagonalDistance });
+                    }
+                } else {
+                    // Diagonal movement
+                    maybeAdd(jpsCardinal(item.point, dx, 0, item.forward, item.distance, state), nexts);
+                    maybeAdd(jpsCardinal(item.point, 0, dy, item.forward, item.distance, state), nexts);
+                    maybeAdd(jpsDiagonal(item.point, dx, dy, item.forward, item.distance, state), nexts);
+
+                    var leftForwardP = { x: item.point.x + (dx + dy) / 2, y: item.point.y - (dx - dy) / 2 };
+                    var rightForwardP = { x: item.point.x + (dx - dy) / 2, y: item.point.y + (dx + dy) / 2 };
+                    var leftBackP = { x: item.point.x - (dx - dy) / 2, y: item.point.y - (dx + dy) / 2 };
+                    var rightBackP = { x: item.point.x - (dx + dy) / 2, y: item.point.y + (dx - dy) / 2 };
+                    if (!isOpen(leftBackP) && isOpen(leftP) && isOpen(leftForwardP)) {
+                        nexts.push({ point: leftP, distance: mapConfig.diagonalDistance });
+                    }
+                    if (!isOpen(rightBackP) && isOpen(rightP) && isOpen(rightForwardP)) {
+                        nexts.push({ point: rightP, distance: mapConfig.diagonalDistance });
+                    }
+                }
+            }
+            break;
+        }
+        for (var i = 0; i < nexts.length; i++) {
+            var neighbor = nexts[i];
+            if (state.pathdata[neighbor.point.y][neighbor.point.x].visited && state.pathdata[neighbor.point.y][neighbor.point.x].forward === item.forward) {
+                // This is unnecessary, but is a useful optimization for keeping the heap small.
+                state.repeatCount++;
+            } else {
+                var newItem = { point: neighbor.point, previous: item.point, distance: item.distance + neighbor.distance, forward: item.forward, depth: item.depth + 1 };
+                insertHeap(heap, adjust(newItem));
+            }
+        }
+    }
+
+    state.pathEnds = [];
+    state.totalDistance = Infinity;
+    state.calculationTime = Date.now() - startTime;
+
+    return state;
+}
+
+function doRedraw() {
+    var drawStartTime = Date.now();
+    ctx.clearRect(0, 0, 800, 600);
+    // We really would like specifically the pixel mixing algorithm, so this occasionally looks a bit wrong at small fractional sizes,
+    // but blitting the prerendered grid is so much nicer and faster than drawing boxes ourselves.
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(bgLayer, 0, 0, gridWidth * squareSize, gridHeight * squareSize);
+    for (var y = 0; y < gridHeight; y++) {
+        for (var x = 0; x < gridWidth; x++) {
+            if (map[y][x]) {
+                continue;
+            } else if (displayData.pathdata[y][x].visited) {
+                if (reach[y][x] !== Infinity) {
+                    ctx.fillStyle = "#ffaa9a";
+                } else {
+                    if (colors) {
+                        ctx.fillStyle = "hsl(" + (displayData.pathdata[y][x].processTime % 360) + ",75%,35%)";
+                    } else {
+                        ctx.fillStyle = "#56aa9a";
+                    }
+                }
+            } else if (displayData.pathdata[y][x].examined) {
+                ctx.fillStyle = "#56919a";
+            } else {
+                continue;
+            }
+            ctx.fillRect(x * squareSize, y * squareSize, squareSize, squareSize);
+        }
+    }
+
+    ctx.strokeStyle = "#2a5545";
+    ctx.beginPath();
+    iterMap(function(x, y) {
+        var prev = displayData.pathdata[y][x].previous;
+        if (prev !== null) {
+            ctx.moveTo(x * squareSize + squareSize / 2, y * squareSize + squareSize / 2);
+            ctx.lineTo(prev.x * squareSize + squareSize / 2, prev.y * squareSize + squareSize / 2);
+        }
+    });
+    ctx.stroke();
+
+    ctx.fillStyle = "#ffff00";
+    for (var l = 0; l < landmarks.length; l++) {
+        ctx.fillRect(landmarks[l].center.x * squareSize, landmarks[l].center.y * squareSize, squareSize, squareSize);
+    }
+
+    ctx.fillStyle = "#980076";
+    var scale = 0.75;
+    ctx.fillRect(startPos.x * squareSize + squareSize * (1 - scale) / 2, startPos.y * squareSize + squareSize * (1 - scale) / 2, squareSize * scale, squareSize * scale);
+    ctx.fillRect(endPos.x * squareSize + squareSize * (1 - scale) / 2, endPos.y * squareSize + squareSize * (1 - scale) / 2, squareSize * scale, squareSize * scale);
+
+    ctx.fillStyle = "#12ff56"
+    for (var i = 0; i < displayData.pathEnds.length; i++) {
+        var curPoint = displayData.pathEnds[i];
+        while (displayData.pathdata[curPoint.y][curPoint.x].previous !== null) {
+            ctx.beginPath();
+            ctx.ellipse(curPoint.x * squareSize + squareSize / 2, curPoint.y * squareSize + squareSize / 2, squareSize * 0.375, squareSize * 0.375, 0, 0, 2 * Math.PI);
+            ctx.fill();
+            curPoint = displayData.pathdata[curPoint.y][curPoint.x].previous;
+        }
+    }
+
+    var drawTotalTime = Date.now() - drawStartTime;
+
+    var algorithm = "";
+    algorithm += algorithmConfig.bidi ? "Bidirectional" : "Unidirectional";
+    algorithm += " ";
+    switch (algorithmConfig.potentialFunc) {
+        case 0:
+            algorithm += "Dijkstra";
+            break;
+        case 1:
+            algorithm += "A* (Standard Potential)";
+            break;
+        case 2:
+            algorithm += "A* (Balanced Potential)";
+            break;
+    }
+    switch (algorithmConfig.reach) {
+    case 0:
+        break;
+    case 1:
+        algorithm += " + Reach";
+        break;
+    case 2:
+        algorithm += " + Edge Reach";
+        break;
+    }
+    switch (algorithmConfig.jumpPoint) {
+    case 0:
+        break;
+    case 1:
+        algorithm += " + "
+        if (algorithmConfig.dualJps) {
+            algorithm += "Dual ";
+        }
+        algorithm += "Jump Point Pruning";
+        break;
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+        algorithm += " + Jump Point Search (" + algorithmConfig.jumpPoint + ")";
+        break;
+    }
+    if (algorithmConfig.prioritize) {
+        algorithm += " + Greedy Tie-breaking";
+    }
+    var heuristic = algorithmConfig.euclidean ? "L2 norm" : "Minimum clear distance";
+    if (algorithmConfig.useLandmarks) {
+        heuristic += " + " + landmarks.length + " landmarks";
+    }
+    stats.innerHTML = "Algorithm: " + algorithm + "<br />Heuristic: " + heuristic + "<br />Visited Cells: " + displayData.visitedCount + " (" + displayData.repeatCount + " repeats, " + displayData.examinedCount + " examined)<br />Distance: " + displayData.totalDistance + "<br />Calculation time: " + displayData.calculationTime + "<br />Draw time: " + drawTotalTime;
+}
+
+doNew();
+doReset();
+doRedraw();
+
+// Event handling
+
+var working = false;
+var workQueue = [];
+
+function processWork() {
+    if (!working) {
+        working = true;
+        var needContinue = false;
+        try {
+            if (workQueue.length > 0) {
+                workQueue.shift()();
+            } else if (!reachDone) {
+                console.log("Autobounding reach.");
+                boundReach();
+            }
+            if (workQueue.length > 0 || !reachDone) {
+                needContinue = true;
+            }
+        } finally {
+            working = false;
+        }
+
+        if (needContinue) {
+            setImmediate(processWork);
+        }
+    }
+}
+
+function schedule(func) {
+    workQueue.push(func);
+    setImmediate(processWork);
+}
+
+function makeSchedOnce(func) {
+    var iteration = 0;
+    return function() {
+        iteration++;
+        var localIter = iteration;
+        schedule(function() {
+            if (iteration === localIter) {
+                func();
+            }
+        });
+    };
+}
+var renew = makeSchedOnce(function() { doNew(); doReset(); recalculate(); });
+var reset = makeSchedOnce(function() { doReset(); redraw(); });
+var recalculate = makeSchedOnce(function() { displayData = doRecalculate(); redraw() });
+var redraw = makeSchedOnce(function() { doRedraw(); });
+
+canvas.addEventListener("click", function(e) { renew(); });
+canvas.addEventListener("mousemove", function(e) {
+    var xOffset = e.pageX - canvas.offsetLeft;
+    var yOffset = e.pageY - canvas.offsetTop;
+    if (0 <= xOffset && xOffset < gridWidth * squareSize && 0 <= yOffset && yOffset < gridHeight * squareSize) {
+        schedule(function() {
+            var newX = Math.floor(xOffset / squareSize);
+            var newY = Math.floor(yOffset / squareSize);
+            //dbg.innerHTML = "Mouse: " + e.pageX + ", " + e.pageY + "<br />Offset: " + xOffset + ", " + yOffset + "<br />Cell: " + newX + ", " + newY;
+            if (!map[newY][newX] && (endPos.x !== newX || endPos.y !== newY)) {
+                endPos.x = newX;
+                endPos.y = newY;
+                recalculate();
+            }
+        });
+    }
+});
+document.getElementById("size").addEventListener("change", function(e) {
+    var newSize = Math.pow(2, this.valueAsNumber);
+    dbg.innerText = "Setting size to " + newSize;
+    schedule(function() {
+        squareSize = newSize;
+        gridWidth = Math.floor(800 / squareSize);
+        gridHeight = Math.floor(600 / squareSize);
+        dbg.innerText = "Rerunning"
+        doReset();
+        doRedraw();
+        dbg.innerText = "Done setting size to " + squareSize;
+    });
+});
+document.addEventListener("keydown", function(e) {
+    switch (e.key) {
+        case "b":
+            schedule(function() { algorithmConfig.bidi = !algorithmConfig.bidi; });
+            recalculate();
+            break;
+        case "c":
+            schedule(function() { colors = !colors; });
+            redraw(); // Redraw
+            break;
+        case "h":
+            schedule(function() { algorithmConfig.potentialFunc = (algorithmConfig.potentialFunc + 1) % 3; });
+            recalculate();
+            break;
+        case "r":
+            schedule(function() { algorithmConfig.reach = (algorithmConfig.reach + 1) % 3; });
+            recalculate();
+            break;
+        case "i":
+            schedule(function() { boundReach(); });
+            redraw();
+            break;
+        case "j":
+            schedule(function() { algorithmConfig.jumpPoint = (algorithmConfig.jumpPoint + 1) % 6; });
+            recalculate();
+            break;
+        case "J":
+            schedule(function() { algorithmConfig.dualJps = !algorithmConfig.dualJps; });
+            recalculate();
+            break;
+        case "l":
+            schedule(function() { addLandmark(endPos); });
+            recalculate();
+            break;
+        case "L":
+            schedule(function() { algorithmConfig.useLandmarks = !algorithmConfig.useLandmarks });
+            recalculate();
+            break;
+        case "e":
+            schedule(function() { algorithmConfig.euclidean = !algorithmConfig.euclidean; });
+            recalculate();
+            break;
+        case "d":
+            schedule(function() { mapConfig.diagMode = (mapConfig.diagMode + 1) % 3; doResetReach(); });
+            recalculate();
+            break;
+        case "n":
+            schedule(function() { doResetStartPos(); });
+            recalculate();
+            break;
+        case "p":
+            schedule(function() { algorithmConfig.prioritize = !algorithmConfig.prioritize; });
+            recalculate();
+            break;
+        case "s":
+            schedule(function() {
+                if (squareSize === 1) {
+                    squareSize = 5;
+                } else if (squareSize === 5) {
+                    squareSize = 10;
+                } else if (squareSize === 10) {
+                    squareSize = 20;
+                } else {
+                    squareSize = 1;
+                }
+                doReset();
+                doRedraw();
+            })
+            break;
+        case "w":
+            schedule(function() { walls = (walls + 1) % 3; });
+            reset();
+            break;
+        case "ArrowUp":
+            schedule(function() { density += 0.05; });
+            reset();
+            break;
+        case "ArrowDown":
+            schedule(function() { density -= 0.05; });
+            reset();
+            break;
+    }
+});
+</script>
+</body>
+</html>
